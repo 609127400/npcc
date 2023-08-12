@@ -1,8 +1,8 @@
 package elect
 
 import (
-	"npcc/common/identity"
-	"npcc/common/net"
+	"npcc/core/identity"
+	"npcc/core/net"
 )
 
 type Elector struct {

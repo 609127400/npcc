@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"npcc/common/config"
+	"npcc/core/config"
 	"path/filepath"
 )
 

@@ -2,7 +2,7 @@ package identity
 
 import (
 	"github.com/stretchr/testify/assert"
-	"npcc/common/config"
+	"npcc/core/config"
 	"testing"
 )
 

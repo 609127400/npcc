@@ -1,45 +1,54 @@
 package main
 
 import (
-	"fmt"
-	"npcc/node"
-	"time"
+	"encoding/hex"
+	"npcc/core/identity"
+	"npcc/pbgo"
 
 	"github.com/spf13/cobra"
-	"npcc/common/config"
+	"npcc/core/config"
 )
 
-func start(cmd *cobra.Command) error {
+func elect(cmd *cobra.Command) error {
 	lc := config.InitLocalConfig(cmd)
+	if idFlag == "" && nodeFlag == "" {
+		panic("must set flag n or id")
+	}
 
-	fmt.Printf("start at %s\n", lc.Path)
+	id := identity.Identity{}
+	id.InitID(lc)
 
-	nodeInstance := node.NPCCNode{}
-	nodeInstance.Init(lc)
+	v := pbgo.Vote{
+		Node: nodeFlag,
+		Id:   idFlag,
+	}
 
-	serve := make(chan error)
-	go func() {
-		var grpcErr error
-		time.Sleep(600 * time.Second)
-		serve <- grpcErr
-	}()
+	msg := []byte(v.Node + v.Id)
+	sig, err := id.Sign(msg, nil)
+	if err != nil {
+		panic(err)
+	}
+	v.Signature = hex.EncodeToString(sig)
 
-	// Block until grpc server exits
-	return <-serve
+	//client := pbgo
+
+	return nil
 }
 
-func startCMD() *cobra.Command {
-	startCmd := &cobra.Command{
-		Use:   "start",
-		Short: "start npcc",
-		Long:  "start npcc blockchain peer",
+func electCMD() *cobra.Command {
+	electCmd := &cobra.Command{
+		Use:   "elect",
+		Short: "npcc elect",
+		Long:  "npcc elect congress people or member of committee",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return start(cmd)
+			return elect(cmd)
 		},
 	}
 	flagList := []string{
-		"config",
+		"role",
+		"identity",
+		"node",
 	}
-	attachFlags(startCmd, flagList)
-	return startCmd
+	attachFlags(electCmd, flagList)
+	return electCmd
 }
