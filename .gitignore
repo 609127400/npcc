@@ -5,7 +5,6 @@
 /bin
 /build
 /.build
-/doc/*
 /tempdoc
 /go.sum
 *.cov
