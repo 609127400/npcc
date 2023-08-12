@@ -1,0 +1,28 @@
+// Copyright the Hyperledger Fabric contributors. All rights reserved.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+option go_package = "./pbgo";
+option java_package = "npcc.pb.java";
+
+package pbgo;
+
+//import "common/common.proto";
+
+
+
+message Vote {
+    string node = 1;
+    string id = 2;
+    string signature = 3;
+}
+
+message BallotResponse {
+
+}
+
+service ElectService {
+    rpc Ballot(stream Vote) returns (stream BallotResponse);
+}
