@@ -14,7 +14,7 @@ import (
 
 func getPemMaterialFromDir(dir string) ([][]byte, error) {
 	var err error
-	if filepath.IsAbs(dir) {
+	if !filepath.IsAbs(dir) {
 		dir, err = filepath.Abs(dir)
 		if err != nil {
 			return nil, fmt.Errorf("abs path err")

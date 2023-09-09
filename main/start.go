@@ -1,9 +1,8 @@
 package main
 
 import (
-	"fmt"
+	"log"
 	"npcc/node"
-	"time"
 
 	"github.com/spf13/cobra"
 	"npcc/core/config"
@@ -12,20 +11,15 @@ import (
 func start(cmd *cobra.Command) error {
 	lc := config.InitLocalConfig(cmd)
 
-	fmt.Printf("start at %s\n", lc.Path)
+	log.Printf("%s start at %s", lc.ID.Name, lc.ID.Path)
 
 	nodeInstance := node.NPCCNode{}
-	nodeInstance.Init(lc)
+	err := nodeInstance.Init(lc)
+	if err != nil {
+		return err
+	}
 
-	serve := make(chan error)
-	go func() {
-		var grpcErr error
-		time.Sleep(600 * time.Second)
-		serve <- grpcErr
-	}()
-
-	// Block until grpc server exits
-	return <-serve
+	return nodeInstance.Start()
 }
 
 func startCMD() *cobra.Command {
@@ -37,9 +31,5 @@ func startCMD() *cobra.Command {
 			return start(cmd)
 		},
 	}
-	flagList := []string{
-		"config",
-	}
-	attachFlags(startCmd, flagList)
 	return startCmd
 }

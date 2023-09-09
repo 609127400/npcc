@@ -2,15 +2,16 @@ blockchain:
   channel: test111
 
 identity:
-  name: node1-11
-  path: D:\npcc\test\org1\members\id1
+  name: node4
+  path: 'D:\npcc\test\org2\members\id4'
 
 net:
   grpc:
-    listenAddr: 0.0.0.0:12223
+    listenAddr: 192.168.31.172:12229
     time:
   p2p:
-    listenAddr: /ip4/0.0.0.0/tcp/11224
+    listenAddr: /ip4/127.0.0.1/tcp/11230
+    protocolID: /npccmsg/1.0.0
     bootstraps:
       - "/ip4/127.0.0.1/tcp/11224/p2p/QmRzn8MhuB5oGziLeoiEWqJYCsWqxJSKxrDNZT2wrAcKmt"
       - "/ip4/127.0.0.1/tcp/11226/p2p/QmWJ561CKzp3eZFq2Ni3sedtxf98ZnyjyzQWtWA1wTFF5P"
@@ -22,7 +23,7 @@ tls:
   cert: tls\server.crt
   key: tls\server.key
   rootCert: tls\ca.crt
-  serverHostOverride: peer0.org1.example.com
+  serverHostOverride: peer1.org2.example.com
   clientAuthRequired: false
   clientRootCAs: tls\ca.crt
   clientKey:
@@ -30,7 +31,7 @@ tls:
 
 log:
   brief:
-    mode: DEV #DEV开发模式 ，PROD生产模式
+    mode: #DEV开发模式 ，PROD生产模式
   verbose:
     level: INFO
     moduleLevel:
@@ -38,9 +39,9 @@ log:
       net: INFO
       vm: INFO
       storage: INFO
-    filePath: ./log/npcc.log
+    filePath: .\log\npcc.log4
     rotationMaxAge: 365                  # 日志最长保存时间，单位：天
     rotationTime: 1              # 日志滚动时间，单位：小时
     rotationSize: 100              # 日志滚动大小，单位：MB
     showLine: true
-    logInConsole: true          # 是否展示日志到终端，仅限于调试使用
+    logInConsole: true

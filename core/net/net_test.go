@@ -8,8 +8,8 @@ import (
 
 func TestNet(t *testing.T) {
 	topic := "test1"
-	n1 := InitLocalNodeWithTopic(topic)
-	n2 := InitLocalNodeWithTopic(topic)
+	n1 := NewLocalP2PNode(topic)
+	n2 := NewLocalP2PNode(topic)
 
 	go func() {
 		n2.ReadLoop(topic)

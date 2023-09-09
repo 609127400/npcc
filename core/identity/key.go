@@ -124,7 +124,7 @@ type ECDSAPublicKey struct {
 }
 
 func (k *ECDSAPublicKey) Bytes() ([]byte, error) {
-	return nil, nil
+	return k.data, nil
 }
 
 func (k *ECDSAPublicKey) Type() KeyType {
@@ -132,7 +132,7 @@ func (k *ECDSAPublicKey) Type() KeyType {
 }
 
 func (k *ECDSAPublicKey) String() (string, error) {
-	return "", nil
+	return string(k.data), nil
 }
 
 func (k *ECDSAPublicKey) Sign(digest []byte) ([]byte, error) {

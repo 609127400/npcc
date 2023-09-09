@@ -20,7 +20,7 @@ type Identity struct {
 
 func (id *Identity) InitID(cf *config.LocalConfig) error {
 	//初始化ca、中间ca
-	pemBytes, err := getPemMaterialFromDir(filepath.Join(cf.Path, ID_CA_PATH))
+	pemBytes, err := getPemMaterialFromDir(filepath.Join(cf.ID.Path, ID_CA_PATH))
 	if err != nil {
 		return err
 	}
@@ -33,7 +33,7 @@ func (id *Identity) InitID(cf *config.LocalConfig) error {
 		}
 		opts.Roots.AddCert(cert)
 	}
-	pemBytes, err = getPemMaterialFromDir(filepath.Join(cf.Path, ID_ItermCA_PATH))
+	pemBytes, err = getPemMaterialFromDir(filepath.Join(cf.ID.Path, ID_ItermCA_PATH))
 	if err != nil {
 		return err
 	}
@@ -47,7 +47,7 @@ func (id *Identity) InitID(cf *config.LocalConfig) error {
 	}
 
 	//初始化身份签名证书
-	pemBytes, err = getPemMaterialFromDir(filepath.Join(cf.Path, ID_SIGN_PATH))
+	pemBytes, err = getPemMaterialFromDir(filepath.Join(cf.ID.Path, ID_SIGN_PATH))
 	if err != nil {
 		return err
 	}
@@ -68,9 +68,10 @@ func (id *Identity) InitID(cf *config.LocalConfig) error {
 		return fmt.Errorf("failed hashing raw cert to compute id of Identity: %s", err)
 	}
 	id.ID = hex.EncodeToString(hash.Sum(nil))
+	id.Name = cf.ID.Name
 
 	//解析私钥
-	pemBytes, err = getPemMaterialFromDir(filepath.Join(cf.Path, ID_KEY_PATH))
+	pemBytes, err = getPemMaterialFromDir(filepath.Join(cf.ID.Path, ID_KEY_PATH))
 	if err != nil {
 		return err
 	}
@@ -100,4 +101,8 @@ func (id *Identity) Sign(data []byte, opts *SignOpts) ([]byte, error) {
 
 func (id *Identity) Verify(data []byte, sig []byte, opts *SignOpts) (bool, error) {
 	return id.pubKey.Verify(data, sig)
+}
+
+func (id *Identity) PublicKey() Key {
+	return id.pubKey
 }

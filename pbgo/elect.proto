@@ -10,19 +10,61 @@ option java_package = "npcc.pb.java";
 package pbgo;
 
 //import "common/common.proto";
-
-
+//任期
+message Term {
+    int32 t = 1;
+    string s = 2;
+    string e = 3;
+}
 
 message Vote {
-    string node = 1;
-    string id = 2;
-    string signature = 3;
+    enum Role {
+        COMMON_PEOPLE    = 0;
+        MEM_PARTY        = 1;
+        DEPUTY_TO_NPC     = 2;
+        MEM_NPC_PRESI    = 3;
+        MEM_NPC_COMMITTEE = 4;
+    }
+
+    string voter = 2;
+    string pubkey = 3;
+    string id = 4;
+    Role role = 5;
+    Term term = 6;
+    string signature = 7;
 }
 
 message BallotResponse {
-
+    int32 status = 1;
+    string msg = 2;
+    bytes data = 3;
 }
 
-service ElectService {
-    rpc Ballot(stream Vote) returns (stream BallotResponse);
+message Identity {
+    string name = 1;
+    string id = 2;
+    string ip = 3;
+}
+
+message Empt {}
+
+message ListResponse {
+    int32 num = 1;
+    repeated Identity ids = 2;
+}
+
+message CalloutVoteResponse {
+    bytes form = 1;
+}
+
+message CheckVoteBoxResponse {
+    bytes form = 1;
+}
+
+service Elect {
+    rpc Ballot(Vote) returns (BallotResponse) {};
+    rpc GetIdentity(Identity) returns (ListResponse) {};
+    rpc List(Empt) returns (ListResponse) {};
+    rpc CalloutVote(Vote) returns (CalloutVoteResponse) {};
+    rpc CheckVoteBox(Vote) returns (CheckVoteBoxResponse) {};
 }

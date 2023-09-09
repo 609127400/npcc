@@ -7,42 +7,88 @@ import (
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	corecrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"npcc/core/msgbus"
+
+	//drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	//dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	//"github.com/multiformats/go-multiaddr"
+	"npcc/common"
+	"strings"
 	"sync"
 )
 
-type Message struct {
-	T     int
-	Topic string
-	Data  []byte
-}
+type Role int
 
-func MakeMessage(topic string, data []byte) Message {
-	return Message{1, topic, data}
-}
+const (
+	Follower Role = 0
+	Leader   Role = 1
+)
 
 type discoveryNotifee struct {
-	h host.Host
+	node *P2PNode
 }
 
 // HandlePeerFound connects to peers discovered via mDNS. Once they're connected,
-func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	fmt.Printf("discovered new peer %s\n", pi.ID.String())
-	err := n.h.Connect(context.Background(), pi)
+func (d *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	pid := pi.ID.String()
+	d.node.log.Infof("%s discovered new peer[%s]", d.node.cfg.Name, pid)
+
+	msgbus.Publish("", common.LocalNetMsg_Discovery, pid)
+	//更新leader
+	d.node.leaderMutex.Lock()
+	if strings.Compare(d.node.leaderID.String(), pid) < 0 {
+		d.node.log.Infof("%s leader changed: [%s] to [%s]", d.node.cfg.Name, d.node.leaderID, pid)
+		d.node.leaderID = pi.ID
+		d.node.role = Follower
+	}
+	d.node.leaderMutex.Unlock()
+
+	//这里假设，A能发现B，则B肯定也能发现A。2个节点。若A>B，则A负责Connect，host.NewStream，并启动r、w，
+	//B则通过host.SetStreamHandler设定的函数启动r、w
+	if strings.Compare(d.node.host.ID().String(), pid) > 0 {
+		return
+	}
+
+	err := d.node.host.Connect(d.node.ctx, pi)
 	if err != nil {
-		fmt.Printf("error connecting to peer %s: %s\n", pi.ID.String(), err)
+		d.node.log.Errorf("%s error connect to peer[id:%s, addr:%s]: %s", d.node.cfg.Name, pi.ID, pi.Addrs[0].String(), err)
+	} else {
+		d.node.log.Infof("%s connected to peer[id:%s, addr:%s]", d.node.cfg.Name, pi.ID, pi.Addrs[0].String())
+	}
+
+	if _, exist := d.node.streamManager.GetStream(pid); !exist {
+		//连接对方节点后，创建NewStream，对方节点中通过host.SetStreamHandler设置的Handler函数将被执行
+		stream, err := d.node.host.NewStream(d.node.ctx, pi.ID, protocol.ID(d.node.cfg.ProtocolID))
+		if err != nil {
+			d.node.log.Errorf("%s new stream to %s err: %s", d.node.cfg.Name, pi.ID, err)
+			return
+		}
+
+		streamHandler := newNodeStreamHandler(d.node.ctx, d.node.cfg.Name, pid, stream, d.node.streamManager, d.node.log)
+		d.node.streamManager.AddStream(pid, streamHandler)
+		go streamHandler.readingMessages()
+		go streamHandler.sendingMessages()
+	} else {
+		fmt.Printf("%s already exist %s's stream handler\n", d.node.cfg.Name, pi.ID.String())
 	}
 }
 
-type NodeConfig struct {
-	addr string
+type connNotifyMsg struct {
+	conn network.Conn
+	on   bool
 }
 
-type Node struct {
-	id          peer.ID
+type P2PNode struct {
+	id   peer.ID
+	role Role
+
+	opts        []libp2p.Option
 	host        host.Host
 	ps          *pubsub.PubSub
 	kademliaDHT *dht.IpfsDHT
@@ -50,6 +96,19 @@ type Node struct {
 	topics      sync.Map
 	subscribers sync.Map
 	ctx         context.Context
+	cfg         *common.P2PNodeConfig
+	log         common.Logger
+	//本地网络中，ID最大的作为唱票节点。
+	//网络中，raft的leader节点作为唱票节点
+	leaderID       peer.ID
+	leaderMutex    sync.Mutex
+	connManager    *PeerConnManager
+	connHandleC    chan *connNotifyMsg
+	connSupervisor *ConnSupervisor
+
+	streamManager *nodeStreamManager
+
+	readyChan chan struct{}
 }
 
 // createLibp2pOptions create all necessary options for libp2p.
@@ -182,58 +241,149 @@ type Node struct {
 //	return options, nil
 //}
 
-func InitLocalNodeWithTopic(t string) *Node {
-	n := &Node{}
+func NewLocalP2PNode(c *common.P2PNodeConfig) *P2PNode {
+	n := &P2PNode{}
 
-	var err error
 	n.ctx = context.Background()
-	opt := libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0")
-	n.host, err = libp2p.New(opt)
+	n.cfg = c
+	n.readyChan = make(chan struct{})
+	n.log = common.GetLogger(common.MODULE_P2PNET)
+
+	privKey, _, err := corecrypto.KeyPairFromStdKey(c.PrivKey)
+	if err != nil {
+		fmt.Printf("[Net] parse private key to priv key failed, %s", err)
+		return nil
+	}
+	n.opts = []libp2p.Option{
+		libp2p.ListenAddrStrings(c.Addr),
+		libp2p.Identity(privKey),
+	}
+	n.streamManager = newNodeStreamManager(n)
+
+	return n
+}
+
+func (n *P2PNode) Start() error {
+	var err error
+	n.host, err = libp2p.New(n.opts...)
 	if err != nil {
 		panic(err)
 	}
-	n.host.Network().Notify(initNetworkNotifiee(n))
+	n.id = n.host.ID()
+	n.leaderID = n.id
+	n.role = Leader //假设
+
+	n.host.SetStreamHandler(protocol.ID(n.cfg.ProtocolID), n.streamManager.GetStreamHandlerFunc(n.ctx))
+
+	//n.host.Network().Notify(initNetworkNotifiee(n))
+	//n.connManager = NewPeerConnManager()
+	//n.connHandleC = make(chan *connNotifyMsg)
+	err = n.startDiscovery()
+	if err != nil {
+		return err
+	}
 
 	n.ps, err = pubsub.NewGossipSub(n.ctx, n.host)
 	if err != nil {
 		panic(err)
 	}
 
-	//discover
-	mdnsService := mdns.NewMdnsService(n.host, "npcc-local-mdns", &discoveryNotifee{h: n.host})
-	if err = mdnsService.Start(); err != nil {
-		panic(err)
-	}
-	options := []dht.Option{dht.Mode(dht.ModeServer)}
-	//if len(bootstraps) > 0 {
-	//	options = append(options, dht.BootstrapPeers(bootstraps...))
-	//}
-	// new kademlia DHT
-	n.kademliaDHT, err = dht.New(n.ctx, n.host, options...)
-	if err != nil {
-		panic(err)
-	}
-	// set as bootstrap
-	if err = n.kademliaDHT.Bootstrap(n.ctx); err != nil {
-		panic(err)
-	}
-
-	n.id = n.host.ID()
-	topic, err := n.ps.Join(t)
+	topic, err := n.ps.Join(n.cfg.Topic)
 	if err != nil {
 		fmt.Println(err)
-		return nil
+		return err
 	}
-	n.topics.Store(t, topic)
+	n.topics.Store(n.cfg.Topic, topic)
 	sub, err := topic.Subscribe()
 	if err != nil {
-		return nil
+		return err
 	}
-	n.subscribers.Store(t, sub)
-	return n
+	n.subscribers.Store(n.cfg.Topic, sub)
+
+	n.log.Infof("%s be local net peer[%s] start...", n.cfg.Name, n.id.String())
+
+	return nil
 }
 
-func (n *Node) Publish(msg Message) error {
+func (n *P2PNode) startDiscovery() error {
+	//mdns discover
+	dn := &discoveryNotifee{n}
+	mdnsService := mdns.NewMdnsService(n.host, n.cfg.Topic, dn)
+	if err := mdnsService.Start(); err != nil {
+		panic(err)
+	}
+
+	//参看libp2p官方例子
+	//dht
+	//var err error
+	//opts := []dht.Option{dht.Mode(dht.ModeServer)}
+	//peers := make([]peer.AddrInfo, 0)
+	//if len(n.cfg.Bootstraps) > 0 {
+	//	for _, v := range n.cfg.Bootstraps {
+	//		addr, err := multiaddr.NewMultiaddr(v)
+	//		if err != nil {
+	//			panic(err)
+	//		}
+	//		peer, err := peer.AddrInfoFromP2pAddr(addr)
+	//		if err != nil {
+	//			panic(err)
+	//		}
+	//		if peer.ID == n.host.ID() {
+	//			continue
+	//		}
+	//		fmt.Printf("append peer: %s", peer.String())
+	//		peers = append(peers, *peer)
+	//		n.connManager.AddAsHighLevelPeer(peer.ID)
+	//	}
+	//	opts = append(opts, dht.BootstrapPeers(peers...))
+	//}
+	//n.kademliaDHT, err = dht.New(n.ctx, n.host, opts...)
+	//if err != nil {
+	//	panic(err)
+	//}
+	//// set as bootstrap
+	//if err = n.kademliaDHT.Bootstrap(n.ctx); err != nil {
+	//	panic(err)
+	//}
+	//
+	//routingDiscovery := drouting.NewRoutingDiscovery(n.kademliaDHT)
+	//dutil.Advertise(n.ctx, routingDiscovery, n.cfg.MsgType)
+	//fmt.Println("Successfully announced!")
+	//
+	//// Now, look for others who have announced
+	//// This is like your friend telling you the location to meet you.
+	//fmt.Println("Searching for other peers...")
+	//peerChan, err := routingDiscovery.FindPeers(n.ctx, n.cfg.MsgType)
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//for peer := range peerChan {
+	//	if peer.ID == n.host.ID() {
+	//		continue
+	//	}
+	//	fmt.Printf("Found peer: %s, connect to it\n", peer)
+	//	stream, err := n.host.NewStream(n.ctx, peer.ID, n.protocolID)
+	//	if err != nil {
+	//		fmt.Printf("Connection failed: %s\n", err)
+	//		continue
+	//	} else {
+	//		fmt.Printf("Connected to: %s\n", peer)
+	//		rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+	//		go writeData(rw)
+	//		go readData(rw)
+	//	}
+	//}
+
+	//参考chainmaker
+
+	//n.connSupervisor = newConnSupervisor(n, peers)
+	//n.connSupervisor.startSupervising(n.readyChan)
+
+	return nil
+}
+
+func (n *P2PNode) Publish(msg Message) error {
 	v, ok := n.topics.Load(msg.Topic)
 	if !ok {
 		return fmt.Errorf("%s topic isn't exist", msg.Topic)
@@ -247,8 +397,84 @@ func (n *Node) Publish(msg Message) error {
 	return topic.Publish(n.ctx, msgBytes)
 }
 
-func (n *Node) SendToNodes(addr []string, msg Message) error {
-	//n.ps.ListPeers()
+func (n *P2PNode) isConnected(addr string) (bool, peer.ID, error) {
+	isConnected := false
+	pid, err := peer.Decode(addr) // peerId
+	if err != nil {
+		return false, pid, err
+	}
+	isConnected = n.connManager.IsConnected(pid)
+	return isConnected, pid, nil
+}
+
+func (n *P2PNode) handleNewPeer(pid peer.ID) error {
+
+	return nil
+}
+
+func (n *P2PNode) closePeer(pid string) {
+	psh, ok := n.streamManager.GetStream(pid)
+	if !ok {
+		return
+	}
+	psh.close()
+	n.streamManager.DeleteStream(pid)
+
+	fmt.Printf("[Host] close the peer send msg handler, peer: [%s]", pid)
+}
+
+/*
+发：msg-> dataChan-> sendingMessages-> psh.stream.Write(writeBytes)-> readHandler.StreamReadHandler
+
+	-> RegisterMessageHandler-> P2PMessageHandler 收
+*/
+func (n *P2PNode) SendToNodes(addrs []string, msg Message) error {
+	//如果addrs为空，则默认发给leader节点
+	if addrs == nil {
+		addrs = []string{n.leaderID.String()}
+	}
+
+	for _, addr := range addrs {
+		if addr == n.id.String() {
+			n.log.Warn("[Net] can not send msg to self")
+			continue
+		}
+		//connManager未使用
+		//isConnected, pid, _ := n.isConnected(addr)
+		//if !isConnected {
+		//	return fmt.Errorf("[Net] send msg failed, node not connected, nodeId: [%s]", addr)
+		//}
+
+		nsh, ok := n.streamManager.GetStream(addr)
+		if !ok {
+			n.log.Errorf("GetStream err, no stream for peer[%s]", addr)
+			return nil
+		}
+
+		if nsh == nil {
+			return fmt.Errorf("psh is nil")
+		}
+		dataChan := nsh.getDataChan()
+		if dataChan == nil {
+			return fmt.Errorf("dataChan is nil")
+		}
+		dataBytes, err := json.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("json marshal msg err: %s", err)
+		}
+
+		select {
+		case <-nsh.ctx.Done():
+			n.log.Infof("use ctx.Done() chan stop send msg to peer[%s]", addr)
+			return fmt.Errorf("ctx.Done happened")
+		case dataChan <- dataBytes:
+			n.log.Infof("put the msg into the peer[%s] stream chan", addr)
+		default:
+			n.log.Errorf("the peer[%s] stream channel is full", addr)
+			return fmt.Errorf("the peer stream channel is full")
+		}
+	}
+
 	return nil
 }
 
@@ -334,27 +560,32 @@ func (n *Node) SendToNodes(addr []string, msg Message) error {
 //	}
 //}
 
-func (n *Node) Subscribe(id string) (*pubsub.Subscription, error) {
-	if v, ok := n.subscribers.Load(id); ok {
+func (n *P2PNode) Subscribe(t string) (*pubsub.Subscription, error) {
+	if v, ok := n.subscribers.Load(t); ok {
 		sub := v.(*pubsub.Subscription)
 		return sub, nil
 	}
 
-	topic, err := n.ps.Join(id)
+	topic, err := n.ps.Join(t)
 	if err != nil {
 		return nil, err
 	}
-	n.topics.Store(id, topic)
+	n.topics.Store(t, topic)
 	sub, err := topic.Subscribe()
 	if err != nil {
 		return nil, err
 	}
-	n.subscribers.Store(id, sub)
+	n.subscribers.Store(t, sub)
 
 	return sub, nil
 }
 
-func (n *Node) ReadLoop(id string) {
+// 保留注册制，但当前主要通过msgbus在各个模块间传递消息
+func (n *P2PNode) RegisterMessageHandler(msgType common.LocalMsgType, handler P2PMessageHandler) {
+	n.streamManager.RegisterStreamHandler(msgType, handler)
+}
+
+func (n *P2PNode) ReadLoop(id string) {
 	v, ok := n.subscribers.Load(id)
 	if !ok {
 		return
@@ -383,25 +614,73 @@ func (n *Node) ReadLoop(id string) {
 	}
 }
 
-func initNetworkNotifiee(n *Node) network.Notifiee {
+func initNetworkNotifiee(n *P2PNode) network.Notifiee {
 	return &network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
-			fmt.Printf("[Host-%s] connecting %s...\n", n.id.String(), c.ID())
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-n.readyChan:
+			}
+
+			n.connHandleC <- &connNotifyMsg{
+				conn: c,
+				on:   true,
+			}
 		},
 		DisconnectedF: func(_ network.Network, c network.Conn) {
-			fmt.Printf("[Host-%s] disconnecting %s...\n", n.id.String(), c.ID())
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-n.readyChan:
+			}
+
+			n.connHandleC <- &connNotifyMsg{
+				conn: c,
+				on:   false,
+			}
 		},
 	}
 }
 
-func (n *Node) handleMessage(msg *Message) {
+func (n *P2PNode) handleMessage(msg *Message) {
 	fmt.Printf("recv msg: %s\n", msg.Data)
 }
 
-func (n *Node) ListPeers(id string) []peer.ID {
-	return n.ps.ListPeers(id)
+func (n *P2PNode) ListPeersByChannelID(channelID string) []peer.ID {
+	return n.ps.ListPeers(channelID)
 }
 
-func (n *Node) Stop() {
+// 给出已加入的所有通道的所有节点ID
+func (n *P2PNode) ListPeers() []peer.ID {
+	var ids []peer.ID
+	f := func(k, v interface{}) bool {
+		t, ok := v.(*pubsub.Topic)
+		if !ok {
+			return false
+		}
+		mem := t.ListPeers()
+		ids = append(ids, mem...)
+		return true
+	}
+	n.topics.Range(f)
+	//TODO:去重
+	ids = append(ids, n.id)
+	return ids
+}
+
+func (n *P2PNode) IsLeader() bool {
+	return n.role == Leader
+}
+
+func (n *P2PNode) PID() string {
+	return n.host.ID().String()
+}
+
+func (n *P2PNode) Name() string {
+	return n.cfg.Name
+}
+
+func (n *P2PNode) Stop() {
 
 }
