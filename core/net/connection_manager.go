@@ -517,32 +517,36 @@ func (cm *PeerConnManager) ConnCount() int {
 }
 
 type nodeStream struct {
-	name     string //本届点名称
+	name     string //本节点名称
 	pid      string //stream连接的对方节点的pid
-	dataChan chan []byte
 	stream   network.Stream
-	ctx      context.Context
-	cancel   context.CancelFunc
-	manager  *nodeStreamManager
-	log      common.Logger
+	dataChan chan []byte
+
+	manager *nodeStreamManager
+	log     common.Logger
+
+	_stopChan chan struct{}
 }
 
 func newNodeStreamHandler(ctx context.Context, n, pid string, s network.Stream, m *nodeStreamManager, log common.Logger) *nodeStream {
 	nsh := &nodeStream{
-		name:     n,
-		pid:      pid,
-		dataChan: make(chan []byte, 1024),
-		stream:   s,
-		manager:  m,
-		log:      log,
+		name:      n,
+		pid:       pid,
+		dataChan:  make(chan []byte, 1024),
+		stream:    s,
+		manager:   m,
+		log:       log,
+		_stopChan: make(chan struct{}),
 	}
-	nsh.ctx, nsh.cancel = context.WithCancel(ctx)
 	return nsh
 }
 
 func (nsh *nodeStream) sendingMessages() {
 	for {
 		select {
+		case <-nsh._stopChan:
+			nsh.log.Infof("stream to %s stop", nsh.pid)
+			return
 		case dataBytes := <-nsh.dataChan:
 			//前8个字节是长度
 			bytesBuffer := bytes.NewBuffer([]byte{})
@@ -559,9 +563,6 @@ func (nsh *nodeStream) sendingMessages() {
 				return
 			}
 			nsh.log.Infof("%s stream send %d byte to %s", nsh.name, size, nsh.pid)
-		case <-nsh.ctx.Done():
-			nsh.log.Errorf("[PeerSendMsgHandler] send the msg failed, err: ctx.Done")
-			return
 		}
 	}
 }
@@ -569,10 +570,21 @@ func (nsh *nodeStream) sendingMessages() {
 func (nsh *nodeStream) readingMessages() {
 	reader := bufio.NewReader(nsh.stream)
 	for {
+		select {
+		case <-nsh._stopChan:
+			return
+		default:
+		}
 		buf := make([]byte, 8)
 		size, err := reader.Read(buf)
 		if err != nil {
-			nsh.log.Errorf("can't read msg length, err:%s", err)
+			//nsh.manager._streamErrChan -> dealStreamErr() -> m.node.closeNode(pid)
+			if !nsh.checkStreamErr(err) {
+				nsh.manager.getStreamErrChan() <- nsh.pid
+				return
+			}
+			nsh.log.Errorf("stream to %s read err: %s", nsh.pid, err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		if size < 8 {
@@ -602,7 +614,11 @@ func (nsh *nodeStream) readingMessages() {
 			zone := buf[count : count+batchSize]
 			size, err = reader.Read(zone)
 			if err != nil {
-				nsh.log.Errorf("can't read msg, err:%s", err)
+				if !nsh.checkStreamErr(err) {
+					nsh.manager.getStreamErrChan() <- nsh.pid
+					return
+				}
+				nsh.log.Errorf("stream to %s read err: %s", nsh.pid, err)
 				break
 			}
 			count += size
@@ -648,11 +664,18 @@ func (nsh *nodeStream) handlingMessages(msg Message) {
 	}
 }
 
+// 返回值：stream是否reading或writing继续
+func (nsh *nodeStream) checkStreamErr(err error) bool {
+	if strings.Contains(err.Error(), "stream reset") {
+		return false
+	}
+	return true
+}
+
 func (nsh *nodeStream) close() {
 	nsh.stream.Reset()
+	close(nsh._stopChan) //停止sendingMsg, readingMsg
 	close(nsh.dataChan)
-	nsh.cancel()
-	fmt.Printf("[PeerSendMsgHandler] msg handler close.\n")
 }
 
 func (nsh *nodeStream) getDataChan() chan<- []byte {
@@ -660,13 +683,22 @@ func (nsh *nodeStream) getDataChan() chan<- []byte {
 }
 
 type nodeStreamManager struct {
-	node     *P2PNode
-	handlers sync.Map
-	streams  sync.Map
+	node           *P2PNode
+	handlers       sync.Map
+	streams        sync.Map
+	_streamErrChan chan string
+	_stopChan      chan struct{}
 }
 
 func newNodeStreamManager(n *P2PNode) *nodeStreamManager {
-	return &nodeStreamManager{node: n}
+	nsm := &nodeStreamManager{
+		node:           n,
+		_streamErrChan: make(chan string, 5),
+		_stopChan:      make(chan struct{}),
+	}
+
+	go nsm.dealStreamErr()
+	return nsm
 }
 
 func (m *nodeStreamManager) DeleteStream(pid string) {
@@ -686,6 +718,21 @@ func (m *nodeStreamManager) GetStream(pid string) (*nodeStream, bool) {
 	return r, ok
 }
 
+func (m *nodeStreamManager) getStreamErrChan() chan string {
+	return m._streamErrChan
+}
+
+func (m *nodeStreamManager) dealStreamErr() {
+	for {
+		select {
+		case <-m._stopChan:
+			return
+		case pid := <-m._streamErrChan:
+			m.node.closeNode(pid)
+		}
+	}
+}
+
 // 对方节点discovery中发现本节点后，host.NewStream，本节点将触发本函数
 func (m *nodeStreamManager) GetStreamHandlerFunc(pctx context.Context) func(network.Stream) {
 	return func(stream network.Stream) {
@@ -696,14 +743,7 @@ func (m *nodeStreamManager) GetStreamHandlerFunc(pctx context.Context) func(netw
 			m.node.log.Warnf("%s to peer[%s]'s stream handler exist", m.node.cfg.Name, pid)
 			return
 		}
-		m.node.leaderMutex.Lock()
-		if strings.Compare(m.node.leaderID.String(), pid) < 0 {
-			m.node.log.Infof("%s leader changed: [%s] to [%s]", m.node.cfg.Name, m.node.leaderID, pid)
-			m.node.leaderID = pi
-			m.node.role = Follower
-		}
-		m.node.leaderMutex.Unlock()
-
+		m.node.leaderManager.AddPID(pid)
 		nsh := newNodeStreamHandler(pctx, m.node.cfg.Name, pid, stream, m, m.node.log)
 		m.AddStream(pid, nsh)
 		go nsh.readingMessages()

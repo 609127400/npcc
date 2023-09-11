@@ -23,13 +23,6 @@ import (
 	"sync"
 )
 
-type Role int
-
-const (
-	Follower Role = 0
-	Leader   Role = 1
-)
-
 type discoveryNotifee struct {
 	node *P2PNode
 }
@@ -41,13 +34,7 @@ func (d *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 	msgbus.Publish("", common.LocalNetMsg_Discovery, pid)
 	//更新leader
-	d.node.leaderMutex.Lock()
-	if strings.Compare(d.node.leaderID.String(), pid) < 0 {
-		d.node.log.Infof("%s leader changed: [%s] to [%s]", d.node.cfg.Name, d.node.leaderID, pid)
-		d.node.leaderID = pi.ID
-		d.node.role = Follower
-	}
-	d.node.leaderMutex.Unlock()
+	d.node.leaderManager.AddPID(pid)
 
 	//这里假设，A能发现B，则B肯定也能发现A。2个节点。若A>B，则A负责Connect，host.NewStream，并启动r、w，
 	//B则通过host.SetStreamHandler设定的函数启动r、w
@@ -85,9 +72,7 @@ type connNotifyMsg struct {
 }
 
 type P2PNode struct {
-	id   peer.ID
-	role Role
-
+	id          peer.ID
 	opts        []libp2p.Option
 	host        host.Host
 	ps          *pubsub.PubSub
@@ -95,13 +80,12 @@ type P2PNode struct {
 
 	topics      sync.Map
 	subscribers sync.Map
-	ctx         context.Context
+	ctx         context.Context //TODO：用ctx控制所有小模块的结束
 	cfg         *common.P2PNodeConfig
 	log         common.Logger
 	//本地网络中，ID最大的作为唱票节点。
 	//网络中，raft的leader节点作为唱票节点
-	leaderID       peer.ID
-	leaderMutex    sync.Mutex
+	leaderManager  *leaderManager
 	connManager    *PeerConnManager
 	connHandleC    chan *connNotifyMsg
 	connSupervisor *ConnSupervisor
@@ -270,9 +254,9 @@ func (n *P2PNode) Start() error {
 		panic(err)
 	}
 	n.id = n.host.ID()
-	n.leaderID = n.id
-	n.role = Leader //假设
 
+	n.leaderManager = newLeaderManager(n.id.String(), n.log)
+	n.leaderManager.AddPID(n.id.String())
 	n.host.SetStreamHandler(protocol.ID(n.cfg.ProtocolID), n.streamManager.GetStreamHandlerFunc(n.ctx))
 
 	//n.host.Network().Notify(initNetworkNotifiee(n))
@@ -407,20 +391,17 @@ func (n *P2PNode) isConnected(addr string) (bool, peer.ID, error) {
 	return isConnected, pid, nil
 }
 
-func (n *P2PNode) handleNewPeer(pid peer.ID) error {
-
-	return nil
-}
-
-func (n *P2PNode) closePeer(pid string) {
+// 清楚一个节点相关的连接、资源占用等
+func (n *P2PNode) closeNode(pid string) {
 	psh, ok := n.streamManager.GetStream(pid)
 	if !ok {
 		return
 	}
 	psh.close()
 	n.streamManager.DeleteStream(pid)
+	n.leaderManager.DelPID(pid)
 
-	fmt.Printf("[Host] close the peer send msg handler, peer: [%s]", pid)
+	n.log.Infof("node[%s] close stream to [%s]", n.cfg.Name, pid)
 }
 
 /*
@@ -431,7 +412,11 @@ func (n *P2PNode) closePeer(pid string) {
 func (n *P2PNode) SendToNodes(addrs []string, msg Message) error {
 	//如果addrs为空，则默认发给leader节点
 	if addrs == nil {
-		addrs = []string{n.leaderID.String()}
+		leaderID := n.leaderManager.LeaderPID()
+		if leaderID == "" {
+			return fmt.Errorf("there is no leader pid")
+		}
+		addrs = []string{leaderID}
 	}
 
 	for _, addr := range addrs {
@@ -464,9 +449,6 @@ func (n *P2PNode) SendToNodes(addrs []string, msg Message) error {
 		}
 
 		select {
-		case <-nsh.ctx.Done():
-			n.log.Infof("use ctx.Done() chan stop send msg to peer[%s]", addr)
-			return fmt.Errorf("ctx.Done happened")
 		case dataChan <- dataBytes:
 			n.log.Infof("put the msg into the peer[%s] stream chan", addr)
 		default:
@@ -670,7 +652,7 @@ func (n *P2PNode) ListPeers() []peer.ID {
 }
 
 func (n *P2PNode) IsLeader() bool {
-	return n.role == Leader
+	return n.leaderManager.IsLeader()
 }
 
 func (n *P2PNode) PID() string {
